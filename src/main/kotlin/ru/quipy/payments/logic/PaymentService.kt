@@ -1,13 +1,21 @@
 package ru.quipy.payments.logic
 
+import ru.quipy.common.utils.CoroutineRateLimiter
+import ru.quipy.common.utils.NonBlockingOngoingWindow
 import java.time.Duration
 import java.util.*
 
 interface PaymentService {
+    val rateLimiter: CoroutineRateLimiter
+    val window: NonBlockingOngoingWindow
+
     /**
      * Submit payment request to external service.
      */
     fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long)
+
+    fun canWait(paymentStartedAt: Long): Boolean
+    fun notOverTime(paymentStartedAt: Long): Boolean
 }
 
 interface PaymentExternalService : PaymentService
