@@ -1,5 +1,8 @@
 package ru.quipy.payments.subscribers
 
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -41,22 +44,10 @@ class OrderPaymentSubscriber {
         return Random().nextInt(4)
     }
 
-    private fun isReset() : Boolean {
+    private fun isReset(): Boolean {
         val value = Random().nextDouble()
         return value <= 0.2
     }
-
-    @Autowired
-    @Qualifier(ExternalServicesConfig.SECOND_PAYMENT_BEAN)
-    private lateinit var secondPaymentService: PaymentService
-
-    @Autowired
-    @Qualifier(ExternalServicesConfig.THIRD_PAYMENT_BEAN)
-    private lateinit var thirdPaymentService: PaymentService
-
-    @Autowired
-    @Qualifier(ExternalServicesConfig.FOURTH_PAYMENT_BEAN)
-    private lateinit var fourthPaymentService: PaymentService
 
     @Autowired
     private lateinit var paymentServices: List<PaymentService>
@@ -65,16 +56,22 @@ class OrderPaymentSubscriber {
 
     private var nearestTimes = longArrayOf(Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE)
 
-    private fun getNearest() : Int {
+    private fun getNearest(): Int {
         val minTime = nearestTimes.min()
         return nearestTimes.indexOf(minTime)
     }
+
+    private val paymentScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     @PostConstruct
     fun init() {
         paymentServices = paymentServices.sortedBy { it.getCost }
 
-        subscriptionsManager.createSubscriber(OrderAggregate::class, "payments:order-subscriber", retryConf = RetryConf(1, RetryFailedStrategy.SKIP_EVENT)) {
+        subscriptionsManager.createSubscriber(
+            OrderAggregate::class,
+            "payments:order-subscriber",
+            retryConf = RetryConf(1, RetryFailedStrategy.SKIP_EVENT)
+        ) {
             `when`(OrderPaymentStartedEvent::class) { event ->
                 paymentExecutor.submit {
                     val createdEvent = paymentESService.create {
@@ -86,40 +83,36 @@ class OrderPaymentSubscriber {
                     }
                     logger.info("Payment ${createdEvent.paymentId} for order ${event.orderId} created.")
 
-                    outerCycle@ while(true) {
-                        if (!isReset()) {
-                            val index = getNearest()
+                    outerCycle@ while (true) {
+                        for (index in paymentServices.indices) {
+                            if (paymentServices[index].getQueries.remainingCapacity() == 0) continue;
                             if (paymentServices[index].window.putIntoWindow()::class == NonBlockingOngoingWindow.WindowResponse.Success::class) {
                                 if (paymentServices[index].rateLimiter.tick()) {
                                     nearestTimes[index] =
                                         (System.currentTimeMillis() + (1.0 / paymentServices[index].getSpeed())).toLong()
-                                    paymentServices[index].submitPaymentRequest(
+                                    paymentServices[index].enqueuePayment(
                                         createdEvent.paymentId,
                                         event.amount,
                                         event.createdAt
                                     )
-                                    break
+                                    break@outerCycle
                                 } else {
                                     paymentServices[index].window.releaseWindow()
                                 }
                             }
-                        } else
-                            for (index in paymentServices.indices) {
-                                if (paymentServices[index].window.putIntoWindow()::class == NonBlockingOngoingWindow.WindowResponse.Success::class) {
-                                    if (paymentServices[index].rateLimiter.tick()) {
-                                        nearestTimes[index] =
-                                            (System.currentTimeMillis() + (1.0 / paymentServices[index].getSpeed())).toLong()
-                                        paymentServices[index].submitPaymentRequest(
-                                            createdEvent.paymentId,
-                                            event.amount,
-                                            event.createdAt
-                                        )
-                                        break@outerCycle
-                                    } else {
-                                        paymentServices[index].window.releaseWindow()
-                                    }
-                                }
-                            }
+                        }
+                        paymentESService.update(createdEvent.paymentId) {
+                            val transactionId = UUID.randomUUID()
+                            logger.warn("${createdEvent.paymentId} не смог оплатиться")
+                            it.logSubmission(
+                                success = true,
+                                transactionId,
+                                now(),
+                                Duration.ofMillis(now() - event.createdAt)
+                            )
+                            it.logProcessing(success = false, processedAt = now(), transactionId = transactionId)
+                        }
+                        break
                     }
                 }
             }

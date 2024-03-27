@@ -2,6 +2,10 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.launch
 import okhttp3.*
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -14,6 +18,7 @@ import java.lang.Double.min
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
@@ -47,8 +52,25 @@ class PaymentExternalServiceImpl(
     override val window: NonBlockingOngoingWindow
         get() = _window
 
+    private val requestCounter = NonBlockingOngoingWindow(parallelRequests)
+
     override val getCost: Double
         get() = cost
+
+    private fun maxQueries() =
+        ((paymentOperationTimeout.toMillis() - requestAverageProcessingTime.toMillis())
+                * getSpeed() * parallelRequests).toInt()
+
+    private val _queries = ArrayBlockingQueue<PaymentInfo>(maxQueries())
+
+    override val getQueries: ArrayBlockingQueue<PaymentInfo>
+        get() = _queries
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val queueProcessingScope = CoroutineScope(Dispatchers.IO.limitedParallelism(100))
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val requestScope = CoroutineScope(Dispatchers.IO.limitedParallelism(100))
 
     @Autowired
     private lateinit var paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
@@ -60,26 +82,33 @@ class PaymentExternalServiceImpl(
         dis.maxRequestsPerHost = parallelRequests
         dis.maxRequests = parallelRequests
         dispatcher(dis)
+        protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
         build()
     }
 
     override fun getSpeed(): Double {
         val averageTime = requestAverageProcessingTime.toMillis().toDouble()
-        return min(parallelRequests.toDouble(), rateLimitPerSec.toDouble().times(averageTime) ) / averageTime
+        return min(
+            parallelRequests.toDouble() / averageTime,
+            rateLimitPerSec.toDouble() / 1000
+        )
     }
 
     override fun canWait(paymentStartedAt: Long): Boolean {
-        return paymentOperationTimeout - Duration.ofMillis(now() - paymentStartedAt) >= requestAverageProcessingTime.multipliedBy(2)
+        return paymentOperationTimeout - Duration.ofMillis(now() - paymentStartedAt) >=
+                requestAverageProcessingTime.multipliedBy(2)
     }
 
     override fun notOverTime(paymentStartedAt: Long): Boolean {
         return Duration.ofMillis(now() - paymentStartedAt) + requestAverageProcessingTime < paymentOperationTimeout
     }
 
-    override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long) {
+    private fun submitPaymentRequest(
+        transactionId: UUID, paymentId: UUID, amount: Int, paymentStartedAt: Long
+    ) = requestScope.launch {
+
         logger.warn("[$accountName] Submitting payment request for payment $paymentId. Already passed: ${now() - paymentStartedAt} ms")
 
-        val transactionId = UUID.randomUUID()
         logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
 
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
@@ -134,6 +163,46 @@ class PaymentExternalServiceImpl(
             }
         })
     }
+
+    override fun enqueuePayment(
+        paymentId: UUID, amount: Int, paymentStartedAt: Long
+    ) = queueProcessingScope.launch {
+        _queries.put(PaymentInfo(paymentId, amount, paymentStartedAt))
+        logger.warn("[${accountName}] Added payment $paymentId in queue. Already passed: ${now() - paymentStartedAt} ms")
+    }
+
+    private val processQueue = queueProcessingScope.launch {
+        while (true) {
+            if (_queries.isNotEmpty()) {
+                val windowResult = requestCounter.putIntoWindow()
+                if (windowResult is NonBlockingOngoingWindow.WindowResponse.Success) {
+                    while (!rateLimiter.tick()) {
+                        continue
+                    }
+                } else {
+                    continue
+                }
+            } else {
+                continue
+            }
+
+            val payment = _queries.take()
+            logger.warn("[${accountName}] Submitting payment request for payment ${payment.id}. Already passed: ${now() - payment.startedAt} ms")
+            val transactionId = UUID.randomUUID()
+            logger.info("[${accountName}] Submit for ${payment.id} , txId: $transactionId")
+            paymentESService.update(payment.id) {
+                it.logSubmission(
+                    success = true, transactionId, now(), Duration.ofMillis(now() - payment.startedAt)
+                )
+            }
+
+            submitPaymentRequest(transactionId, payment.id, payment.amount, payment.startedAt)
+        }
+    }
+
+    data class PaymentInfo(
+        val id: UUID, val amount: Int, val startedAt: Long
+    )
 }
 
 public fun now() = System.currentTimeMillis()
