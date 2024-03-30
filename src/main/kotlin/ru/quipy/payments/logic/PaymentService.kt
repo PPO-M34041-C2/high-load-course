@@ -1,6 +1,5 @@
 package ru.quipy.payments.logic
 
-import kotlinx.coroutines.Job
 import ru.quipy.common.utils.CoroutineRateLimiter
 import ru.quipy.common.utils.NonBlockingOngoingWindow
 import java.time.Duration
@@ -15,7 +14,7 @@ interface PaymentService {
     /**
      * Submit payment request to external service.
      */
-    fun enqueuePayment(paymentId: UUID, amount: Int, paymentStartedAt: Long) : Job
+    fun enqueuePayment(paymentId: UUID, amount: Int, paymentStartedAt: Long)
 
     fun canWait(paymentStartedAt: Long): Boolean
     fun notOverTime(paymentStartedAt: Long): Boolean
@@ -24,8 +23,7 @@ interface PaymentService {
     val getCost: Double
 }
 
-interface PaymentExternalService : PaymentService {
-}
+interface PaymentExternalService : PaymentService
 
 /**
  * Describes properties of payment-provider accounts.

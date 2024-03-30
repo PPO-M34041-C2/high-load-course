@@ -2,10 +2,6 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.launch
 import okhttp3.*
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -25,7 +21,7 @@ import java.util.concurrent.TimeUnit
 
 // Advice: always treat time as a Duration
 class PaymentExternalServiceImpl(
-    private val properties: ExternalServiceProperties,
+    properties: ExternalServiceProperties,
 ) : PaymentExternalService {
 
     companion object {
@@ -66,11 +62,9 @@ class PaymentExternalServiceImpl(
     override val getQueries: ArrayBlockingQueue<PaymentInfo>
         get() = _queries
 
-    @OptIn(ExperimentalCoroutinesApi::class)
-    private val queueProcessingScope = CoroutineScope(Dispatchers.IO.limitedParallelism(100))
-
-    @OptIn(ExperimentalCoroutinesApi::class)
-    private val requestScope = CoroutineScope(Dispatchers.IO.limitedParallelism(100))
+    private val queueProcessingExecutor = Executors.newFixedThreadPool(100)
+    private val requestExecutor = Executors.newFixedThreadPool(100)
+    private val responseExecutor = Executors.newFixedThreadPool(100)
 
     @Autowired
     private lateinit var paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
@@ -104,8 +98,8 @@ class PaymentExternalServiceImpl(
     }
 
     private fun submitPaymentRequest(
-        transactionId: UUID, paymentId: UUID, amount: Int, paymentStartedAt: Long
-    ) = requestScope.launch {
+        transactionId: UUID, paymentId: UUID, paymentStartedAt: Long
+    ) = requestExecutor.execute {
 
         logger.warn("[$accountName] Submitting payment request for payment $paymentId. Already passed: ${now() - paymentStartedAt} ms")
 
@@ -124,54 +118,63 @@ class PaymentExternalServiceImpl(
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                when (e) {
-                    is SocketTimeoutException -> {
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                responseExecutor.execute {
+                    when (e) {
+                        is SocketTimeoutException -> {
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                            }
+                        }
+
+                        else -> {
+                            logger.error(
+                                "[$accountName] Payment failed for txId: $transactionId, payment: $paymentId",
+                                e
+                            )
+
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, now(), transactionId, reason = e.message)
+                            }
                         }
                     }
-
-                    else -> {
-                        logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = e.message)
-                        }
-                    }
+                    window.releaseWindow()
                 }
-                window.releaseWindow()
             }
 
             override fun onResponse(call: Call, response: Response) {
-                response.use {
-                    val body = try {
-                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                        ExternalSysResponse(false, e.message)
-                    }
+                responseExecutor.execute {
+                    response.use {
+                        val body = try {
+                            mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                        } catch (e: Exception) {
+                            logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                            ExternalSysResponse(false, e.message)
+                        }
 
-                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}, duration: ${now() - paymentStartedAt}")
+                        logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}, duration: ${now() - paymentStartedAt}")
 
-                    // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                    // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                        // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+                        // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                        }
                     }
+                    window.releaseWindow()
                 }
-                window.releaseWindow()
             }
         })
     }
 
     override fun enqueuePayment(
         paymentId: UUID, amount: Int, paymentStartedAt: Long
-    ) = queueProcessingScope.launch {
-        _queries.put(PaymentInfo(paymentId, amount, paymentStartedAt))
-        logger.warn("[${accountName}] Added payment $paymentId in queue. Already passed: ${now() - paymentStartedAt} ms")
+    ) {
+        queueProcessingExecutor.execute {
+            _queries.put(PaymentInfo(paymentId, amount, paymentStartedAt))
+            logger.warn("[${accountName}] Added payment $paymentId in queue. Already passed: ${now() - paymentStartedAt} ms")
+        }
     }
 
-    private val processQueue = queueProcessingScope.launch {
+    private val processQueue = queueProcessingExecutor.execute {
         while (true) {
             if (_queries.isNotEmpty()) {
                 val windowResult = requestCounter.putIntoWindow()
@@ -196,7 +199,7 @@ class PaymentExternalServiceImpl(
                 )
             }
 
-            submitPaymentRequest(transactionId, payment.id, payment.amount, payment.startedAt)
+            submitPaymentRequest(transactionId, payment.id, payment.startedAt)
         }
     }
 
@@ -205,4 +208,4 @@ class PaymentExternalServiceImpl(
     )
 }
 
-public fun now() = System.currentTimeMillis()
+fun now() = System.currentTimeMillis()
