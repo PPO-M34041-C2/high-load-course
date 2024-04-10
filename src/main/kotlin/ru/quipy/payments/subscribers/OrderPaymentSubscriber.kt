@@ -64,7 +64,7 @@ class OrderPaymentSubscriber {
                                 if (paymentServices[index].rateLimiter.tick()) {
                                     nearestTimes[index] =
                                         (System.currentTimeMillis() + (1.0 / paymentServices[index].getSpeed())).toLong()
-                                    paymentServices[index].enqueuePayment(
+                                    paymentServices[index].enqueueQuery(
                                         createdEvent.paymentId,
                                         event.amount,
                                         event.createdAt

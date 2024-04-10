@@ -14,7 +14,7 @@ interface PaymentService {
     /**
      * Submit payment request to external service.
      */
-    fun enqueuePayment(paymentId: UUID, amount: Int, paymentStartedAt: Long)
+    fun enqueueQuery(paymentId: UUID, amount: Int, paymentStartedAt: Long)
 
     fun canWait(paymentStartedAt: Long): Boolean
     fun notOverTime(paymentStartedAt: Long): Boolean
